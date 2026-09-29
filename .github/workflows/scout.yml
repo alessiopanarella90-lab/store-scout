@@ -1,0 +1,76 @@
+name: Store scout
+
+# Legge le pagine pubbliche del Chrome Web Store con 6 processi in parallelo.
+# Ogni processo ha la sua parte fissa delle estensioni e il suo database;
+# i database sono salvati come file della release "data".
+on:
+  schedule:
+    - cron: "7 18 * * *"
+  workflow_dispatch:
+    inputs:
+      refresh_sitemap:
+        description: "Aggiorna subito l'elenco delle estensioni"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scout
+  cancel-in-progress: false
+
+env:
+  SHARDS: "6"
+  PYTHONUNBUFFERED: "1"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sitemap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Prepara la release "data"
+        run: gh release view data >/dev/null 2>&1 || gh release create data --title "data" --notes "Database del motore (aggiornati ogni giorno)"
+      - name: Aggiorna l'elenco (lunedi', primo avvio o su richiesta)
+        run: |
+          has=$(gh release view data --json assets -q '.assets[].name' | grep -c '^urls.tsv.gz$' || true)
+          if [ "$(date -u +%u)" = "1" ] || [ "$has" = "0" ] || [ "${{ inputs.refresh_sitemap }}" = "true" ]; then
+            python -m discovery.run sitemap --out-tsv urls.tsv.gz
+            gh release upload data urls.tsv.gz --clobber
+          else
+            echo "Elenco gia' presente, salto."
+          fi
+
+  crawl:
+    needs: sitemap
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Scarica elenco e database di questa parte
+        run: |
+          mkdir -p data
+          gh release download data -p urls.tsv.gz -D data --clobber
+          gh release download data -p "shard-${{ matrix.shard }}.sqlite.gz" -D data --clobber 2>/dev/null && gunzip -f data/shard-${{ matrix.shard }}.sqlite.gz || echo "Primo avvio di questa parte"
+      - name: Aggiunge le estensioni nuove
+        env: { ORFANE_DB: "data/shard-${{ matrix.shard }}.sqlite" }
+        run: python -m discovery.run import-urls --file data/urls.tsv.gz --shard ${{ matrix.shard }} --shards $SHARDS
+      - name: Legge le pagine
+        env: { ORFANE_DB: "data/shard-${{ matrix.shard }}.sqlite" }
+        run: python -m discovery.run crawl --minutes 320 --limit 60000 --delay 0.6
+      - name: Salva il database
+        if: always()
+        run: |
+          [ -s data/shard-${{ matrix.shard }}.sqlite ] || exit 0
+          gzip -kf data/shard-${{ matrix.shard }}.sqlite
+          for i in 1 2 3; do gh release upload data data/shard-${{ matrix.shard }}.sqlite.gz --clobber && break; sleep 15; done
